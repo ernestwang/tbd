@@ -17,6 +17,11 @@ package tbd.datastore
 
 import akka.actor.{ActorRef, ActorContext, Props}
 import akka.pattern.ask
+import com.sleepycat.je.{Environment, EnvironmentConfig}
+import com.sleepycat.persist.{EntityStore, StoreConfig}
+import com.sleepycat.persist.model.{Entity, PrimaryKey, SecondaryKey}
+import com.sleepycat.persist.model.Relationship
+import java.io._
 import scala.collection.mutable.Map
 import scala.concurrent.Await
 
@@ -32,16 +37,43 @@ class LRUNode(
 )
 
 class BerkeleyDBStore(cacheSize: Int, context: ActorContext) extends KVStore {
-  val numPartitions = 1
+  println("new BerkeleyDBStore " + cacheSize)
+  private var environment: Environment = null
+  private var store: EntityStore = null
 
-  val partitions = Map[Int, ActorRef]()
-  for (i <- 0 until numPartitions) {
-    partitions(i) = context.actorOf(Props[BerkeleyDBActor])
+  private val envConfig = new EnvironmentConfig()
+  envConfig.setAllowCreate(true)
+  val storeConfig = new StoreConfig()
+  storeConfig.setAllowCreate(true)
+
+  val random = new scala.util.Random()
+  private val envHome = new File("/tmp/tbd_berkeleydb" + random.nextInt())
+  envHome.mkdir()
+
+  try {
+    // Open the environment and entity store
+    environment = new Environment(envHome, envConfig)
+    store = new EntityStore(environment, "EntityStore", storeConfig)
+  } catch {
+    case fnfe: FileNotFoundException => {
+      System.err.println("setup(): " + fnfe.toString())
+      System.exit(-1)
+    }
   }
 
+  val pIdx = store.getPrimaryIndex(classOf[ModId], classOf[ModEntity])
+
+  // LRU cache
   private val values = Map[ModId, LRUNode]()
   private val tail = new LRUNode(null, null, null, null)
   private var head = tail
+
+  // Statistics
+  var readCount = 0
+  var writeCount = 0
+  var deleteCount = 0
+
+  println("done initializing")
 
   def put(key: ModId, value: Any) {
     if (values.contains(key)) {
@@ -54,16 +86,29 @@ class BerkeleyDBStore(cacheSize: Int, context: ActorContext) extends KVStore {
       head = newNode
 
       if (values.size > cacheSize) {
-	evict()
+        evict()
       }
     }
   }
 
   private def evict() {
     while (values.size > cacheSize) {
+      println("evicting")
       val toEvict = tail.previous
 
-      getPartition(toEvict.key) ! DBPutMessage(toEvict.key, toEvict.value)
+      val key = toEvict.key
+      val value = toEvict.value
+
+      writeCount += 1
+      val entity = new ModEntity()
+      entity.key = key
+
+      val byteOutput = new ByteArrayOutputStream()
+      val objectOutput = new ObjectOutputStream(byteOutput)
+      objectOutput.writeObject(value)
+      entity.value = byteOutput.toByteArray
+
+      pIdx.put(entity)
 
       values -= toEvict.key
 
@@ -76,8 +121,19 @@ class BerkeleyDBStore(cacheSize: Int, context: ActorContext) extends KVStore {
     if (values.contains(key)) {
       values(key).value
     } else {
-      val future = getPartition(key) ? DBGetMessage(key)
-      Await.result(future, DURATION)
+      readCount += 1
+      val byteArray = pIdx.get(key).value
+
+      val byteInput = new ByteArrayInputStream(byteArray)
+      val objectInput = new ObjectInputStream(byteInput)
+      val obj = objectInput.readObject()
+
+      // No idea why this is necessary.
+      if (obj != null && obj.isInstanceOf[Tuple2[_, _]]) {
+        obj.toString
+      }
+
+      obj
     }
   }
 
@@ -86,16 +142,26 @@ class BerkeleyDBStore(cacheSize: Int, context: ActorContext) extends KVStore {
       values -= key
     }
 
-    getPartition(key) ! DBDeleteMessage(key)
+    //deleteCount += 1
+    //pIdx.delete(key)
+  }
+
+  def contains(key: ModId) = {
+    values.contains(key) || pIdx.contains(key)
   }
 
   def shutdown() {
-    for ((num, partition) <- partitions) {
-      partition ! DBShutdownMessage()
-    }
+    println("Shutting down. writes = " + writeCount + ", reads = " +
+            readCount + ", deletes = " + deleteCount)
+    store.close()
+    environment.close()
   }
+}
 
-  private def getPartition(key: ModId): ActorRef = {
-    partitions(key.hashCode % numPartitions)
-  }
+@Entity
+class ModEntity {
+  @PrimaryKey
+  var key: ModId = null
+
+  var value: Array[Byte] = null
 }
